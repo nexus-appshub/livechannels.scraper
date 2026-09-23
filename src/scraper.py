@@ -549,21 +549,41 @@ class ChannelManager:
                 self.last_config_error = f"Invalid JSON: {exc}"
                 channels = []
 
-        self.channels = [ch for ch in channels if ch.enabled]
+        fresh_channels = [ch for ch in channels if ch.enabled]
+        old_by_name = {ch.name: ch for ch in self.channels}
+
+        # Reuse existing channel objects when possible so worker health state
+        # survives catalog refreshes.
+        normalized: list[Channel] = []
+        for fresh in fresh_channels:
+            existing = old_by_name.get(fresh.name)
+            if existing is not None:
+                existing.url = fresh.url
+                existing.output_dir = fresh.output_dir
+                existing.headers = fresh.headers
+                existing.enabled = fresh.enabled
+                existing.poll_seconds = fresh.poll_seconds
+                existing.max_bandwidth = fresh.max_bandwidth
+                normalized.append(existing)
+            else:
+                normalized.append(fresh)
+
+        self.channels = normalized
         self._by_id.clear()
         self._allowed_hosts.clear()
 
         used_ids: set[str] = set()
         for index, channel in enumerate(self.channels):
             base_id = self._slug(channel.name, f"channel-{index}")
-            cid = base_id
+            cid = channel.id or base_id
             counter = 2
             while cid in used_ids:
                 cid = f"{base_id}-{counter}"
                 counter += 1
 
             channel.id = cid
-            channel.health_status = "STARTING"
+            if channel.health_status == "UNKNOWN":
+                channel.health_status = "STARTING"
             used_ids.add(cid)
             self._by_id[cid] = channel
 
