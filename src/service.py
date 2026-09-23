@@ -176,7 +176,7 @@ video { width:100%; aspect-ratio:16/9; background:#000; border-radius:12px; } .s
 <button class="tab" data-tab="streams">Streams, M3U8 &amp; Logs</button>
 </nav>
 
-<section id="view-channels" class="view active"><div class="panel"><div class="section-head"><div><h2>Configured / Remote Channels</h2><div class="hint">Channels loaded from REMOTE_CONFIG_URL, channels.json, or CHANNELS_JSON.</div></div><button class="btn" onclick="loadChannels()">Refresh</button></div><div id="channelGrid" class="grid"><div class="empty">Loading channels...</div></div></div></section>
+<section id="view-channels" class="view active"><div class="panel"><div class="section-head"><div><h2>Configured / Remote Channels</h2><div class="hint">Channels load automatically from REMOTE_CONFIG_URL / CHANNELS_URL, channels.json, or CHANNELS_JSON.</div></div><button class="btn" onclick="loadChannels()">Refresh</button></div><div id="channelGrid" class="grid"><div class="empty">Loading channels...</div></div></div></section>
 
 <section id="view-extractor" class="view"><div class="panel"><div class="section-head"><div><h2>Universal URL Scraper</h2><div class="hint">Enter a public website, M3U/M3U8 playlist, or embed page. The scanner checks exposed media URLs, source/video tags, player config, scripts and one level of iframes.</div></div></div>
 <form id="scrapeForm"><div class="form-row"><input id="targetUrl" type="url" required placeholder="https://example.com/live or https://example.com/playlist.m3u8"><button id="scrapeBtn" class="btn primary" type="submit">Deep Scan</button></div></form>
@@ -199,7 +199,7 @@ function clearResults(){discovered=[];document.getElementById('streamFilter').va
 function switchTab(tab){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+tab));}
 document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.tab)));
 
-async function loadChannels(){try{const r=await fetch('/api/channels',{cache:'no-store'});const data=await r.json();const list=data.channels||[];document.getElementById('channelCount').innerText=list.length;const grid=document.getElementById('channelGrid');if(!list.length){grid.innerHTML='<div class="empty">No configured channels. Set REMOTE_CONFIG_URL or CHANNELS_JSON.</div>';return;}
+async function loadChannels(){try{const refresh=await fetch('/api/config/refresh',{method:'POST'});const refreshData=await refresh.json();if(!refresh.ok||!refreshData.success){log('Remote catalog refresh failed: '+(refreshData.detail||'unknown error'),'error');}const r=await fetch('/api/channels',{cache:'no-store'});const data=await r.json();const list=data.channels||[];document.getElementById('channelCount').innerText=list.length;const grid=document.getElementById('channelGrid');if(!list.length){grid.innerHTML='<div class="empty">No configured channels. Set REMOTE_CONFIG_URL, CHANNELS_URL, CHANNELS_CONFIG_URL, or CHANNELS_JSON.</div>';if(refreshData.lastError)log('Config error: '+refreshData.lastError,'error');return;}
 grid.innerHTML=list.map(ch=>{const u=new URL(ch.gatewayUrl,location.origin).href;return '<div class="card"><div class="channel-title"><span>'+esc(ch.name)+'</span><span class="status '+esc((ch.status||'unknown').toLowerCase())+'">'+esc(ch.status||'UNKNOWN')+'</span></div><div class="url">'+esc(u)+'</div><div class="actions"><button class="btn primary" onclick="copyText('+JSON.stringify(u)+')">Copy M3U8</button><button class="btn success" onclick="play('+JSON.stringify(u)+')">Play</button><a class="btn" href="'+esc(u)+'" target="_blank" rel="noopener">Open</a></div></div>';}).join('');
 }catch(e){document.getElementById('sysBadge').innerText='API Error';log('Channel API error: '+e.message,'error');}}
 
@@ -234,7 +234,44 @@ async def handle_health(_: web.Request) -> web.Response:
         "service": "livechannels-scraper",
         "workers": len(channel_manager.channels),
         "configured": configured,
+        "channelCount": len(channel_manager.channels),
+        "configSource": channel_manager.config_source,
+        "remoteConfigConfigured": channel_manager.remote_config_configured,
+        "configError": channel_manager.last_config_error,
     })
+
+@routes.get("/api/config-status")
+async def handle_config_status(_: web.Request) -> web.Response:
+    return web.json_response({
+        "success": True,
+        "channelCount": len(channel_manager.channels),
+        "configSource": channel_manager.config_source,
+        "remoteConfigConfigured": channel_manager.remote_config_configured,
+        "lastError": channel_manager.last_config_error,
+        "lastFetchAgeSeconds": (
+            max(0.0, asyncio.get_running_loop().time() - channel_manager.last_config_at)
+            if channel_manager.last_config_at is not None else None
+        ),
+    })
+
+@routes.post("/api/config/refresh")
+async def handle_config_refresh(request: web.Request) -> web.Response:
+    try:
+        before = {ch.name: (ch.url, tuple(sorted(ch.headers.items()))) for ch in channel_manager.channels}
+        await channel_manager.load_config()
+        after = {ch.name: (ch.url, tuple(sorted(ch.headers.items()))) for ch in channel_manager.channels}
+        refresh_workers = request.app.get("refresh_channels")
+        if refresh_workers is not None and before != after:
+            await refresh_workers()
+        return web.json_response({
+            "success": True,
+            "channelCount": len(channel_manager.channels),
+            "configSource": channel_manager.config_source,
+            "lastError": channel_manager.last_config_error,
+        })
+    except Exception as exc:
+        logger.exception("manual channel catalog refresh failed")
+        return web.json_response({"success": False, "detail": str(exc)}, status=502)
 
 
 @routes.post("/api/deep-scrape")
@@ -440,11 +477,19 @@ async def init_app() -> web.Application:
 
     refresh_task = asyncio.create_task(refresh_loop(), name="channel-catalog-refresh")
 
+    async def refresh_channels_now() -> None:
+        before = {ch.name: ch.url for ch in channel_manager.channels}
+        await channel_manager.load_config()
+        after = {ch.name: ch.url for ch in channel_manager.channels}
+        if before != after:
+            await reconcile_workers(force=True)
+
     app["http_session"] = session
     app["hls_client"] = client
     app["stop_event"] = stop
     app["worker_tasks"] = tasks
     app["refresh_task"] = refresh_task
+    app["refresh_channels"] = refresh_channels_now
 
     async def cleanup(_: web.Application) -> None:
         stop.set()
