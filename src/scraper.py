@@ -486,6 +486,8 @@ class ChannelManager:
         self._allowed_hosts: dict[str, set[str]] = {}
         self._client: Optional[HLSClient] = None
         self.is_configured = False
+        self.last_config_at: Optional[float] = None
+        self.last_config_error: Optional[str] = None
 
     def configure_client(self, client: HLSClient) -> None:
         self._client = client
@@ -534,7 +536,8 @@ class ChannelManager:
                     channels = await fetch_remote_channels(
                         session, remote_url, output_root, timeout
                     )
-            except Exception:
+            except Exception as exc:
+                self.last_config_error = str(exc)
                 LOG.exception("remote channel configuration failed")
                 channels = []
 
@@ -560,6 +563,8 @@ class ChannelManager:
             self._allowed_hosts[cid] = {host.lower()} if host else set()
 
         self.is_configured = bool(self.channels)
+        self.last_config_at = asyncio.get_running_loop().time()
+        self.last_config_error = None
         LOG.info("loaded %d channel(s)", len(self.channels))
         return self.channels
 
