@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import ipaddress
 import logging
 import os
@@ -73,16 +74,30 @@ def build_dashboard(channels: list[Channel], request: web.Request) -> str:
     base = str(request.url.origin())
     rows = []
 
+    if not channels:
+        rows.append(
+            """
+            <tr>
+              <td colspan="3">
+                <strong>No channels configured</strong><br><br>
+                Add the Railway/Render environment variable
+                <code>CHANNELS_JSON</code> containing your channel configuration,
+                then redeploy/restart the service.
+              </td>
+            </tr>
+            """
+        )
+
     for channel in channels:
         cid = channel_id(channel)
         stream = f"{base}/stream/{cid}/master.m3u8"
         rows.append(
             f"""
             <tr>
-              <td><strong>{web.html_escape(channel.name)}</strong></td>
-              <td><code>{web.html_escape(channel.url)}</code></td>
+              <td><strong>{html.escape(channel.name)}</strong></td>
+              <td><code>{html.escape(channel.url)}</code></td>
               <td>
-                <button onclick="copyText('{web.html_escape(stream)}')">Copy M3U8</button>
+                <button onclick="copyText('{html.escape(stream, quote=True)}')">Copy M3U8</button>
                 <a href="{web.html_escape(stream)}" target="_blank" rel="noopener">Open</a>
               </td>
             </tr>
@@ -140,9 +155,17 @@ async def run_service() -> None:
     config_path = Path(os.getenv("CHANNEL_CONFIG", "channels.json"))
     append_ts = os.getenv("APPEND_TS", "false").lower() in {"1", "true", "yes", "on"}
 
-    channels = load_channels(config_path, output_dir)
-    if not channels:
-        raise RuntimeError("No enabled channels configured")
+    try:
+        channels = load_channels(config_path, output_dir)
+    except FileNotFoundError:
+        LOG.warning(
+            "No channel configuration found. Set CHANNELS_JSON or provide %s.",
+            config_path,
+        )
+        channels = []
+    except json.JSONDecodeError as exc:
+        LOG.error("Invalid channel configuration JSON: %s", exc)
+        channels = []
 
     by_id = channel_lookup(channels)
     allowed_hosts_by_channel: dict[str, set[str]] = {}
@@ -171,9 +194,10 @@ async def run_service() -> None:
 
         async def health(_: web.Request) -> web.Response:
             return web.json_response({
-                "status": "ok",
+                "status": "ok" if channels else "degraded",
                 "service": "livechannels-scraper",
                 "workers": len(channels),
+                "configured": bool(channels),
             })
 
         async def api_channels(_: web.Request) -> web.Response:
