@@ -43,6 +43,8 @@ class Channel:
     enabled: bool = True
     poll_seconds: Optional[float] = None
     max_bandwidth: Optional[int] = None
+    id: str = ""
+    health_status: str = "UNKNOWN"
 
 
 @dataclass(slots=True)
@@ -244,6 +246,7 @@ class ChannelWorker:
                     resolved = resolve_master(
                         final_url, body, self.channel.max_bandwidth
                     )
+                    self.channel.health_status = "HEALTHY"
 
                     if resolved.master:
                         LOG.info(
@@ -260,12 +263,15 @@ class ChannelWorker:
 
                 except AccessDeniedError as exc:
                     # Access-control failure is reported, never bypassed.
+                    self.channel.health_status = "DOWN"
                     LOG.error("[%s] access denied: %s", self.channel.name, exc)
                     await wait_or_stop(self.stop, 30)
                 except UpstreamError as exc:
+                    self.channel.health_status = "DEGRADED"
                     LOG.warning("[%s] upstream failure: %s", self.channel.name, exc)
                     await wait_or_stop(self.stop, 5)
                 except Exception:
+                    self.channel.health_status = "DEGRADED"
                     LOG.exception("[%s] unexpected worker failure", self.channel.name)
                     await wait_or_stop(self.stop, 5)
         finally:
@@ -393,6 +399,136 @@ def load_channels(path: Path, output_root: Path) -> list[Channel]:
         )
 
     return result
+
+
+class ChannelManager:
+    """Compatibility facade for the web service around the scraper's channel registry."""
+
+    def __init__(self) -> None:
+        self.channels: list[Channel] = []
+        self._by_id: dict[str, Channel] = {}
+        self._allowed_hosts: dict[str, set[str]] = {}
+        self._client: Optional[HLSClient] = None
+        self.is_configured = False
+
+    def configure_client(self, client: HLSClient) -> None:
+        self._client = client
+
+    @staticmethod
+    def _slug(value: str, fallback: str) -> str:
+        import re
+        slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+        return slug or fallback
+
+    @staticmethod
+    def _is_public_hostname(hostname: Optional[str]) -> bool:
+        if not hostname:
+            return False
+        try:
+            ip = ipaddress.ip_address(hostname)
+            return not (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+                or ip.is_unspecified
+            )
+        except ValueError:
+            return True
+
+    async def load_config(self) -> list[Channel]:
+        output_root = Path(os.getenv("OUTPUT_DIR", "data"))
+        config_path = Path(os.getenv("CHANNEL_CONFIG", "channels.json"))
+
+        try:
+            channels = load_channels(config_path, output_root)
+        except FileNotFoundError:
+            channels = []
+        except json.JSONDecodeError:
+            channels = []
+
+        remote_url = os.getenv("REMOTE_CONFIG_URL", "").strip()
+        if not channels and remote_url:
+            try:
+                timeout = float(os.getenv("REMOTE_CONFIG_TIMEOUT", "15"))
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as session:
+                    channels = await fetch_remote_channels(
+                        session, remote_url, output_root, timeout
+                    )
+            except Exception:
+                LOG.exception("remote channel configuration failed")
+                channels = []
+
+        self.channels = [ch for ch in channels if ch.enabled]
+        self._by_id.clear()
+        self._allowed_hosts.clear()
+
+        used_ids: set[str] = set()
+        for index, channel in enumerate(self.channels):
+            base_id = self._slug(channel.name, f"channel-{index}")
+            cid = base_id
+            counter = 2
+            while cid in used_ids:
+                cid = f"{base_id}-{counter}"
+                counter += 1
+
+            channel.id = cid
+            channel.health_status = "STARTING"
+            used_ids.add(cid)
+            self._by_id[cid] = channel
+
+            host = urlparse(channel.url).hostname
+            self._allowed_hosts[cid] = {host.lower()} if host else set()
+
+        self.is_configured = bool(self.channels)
+        LOG.info("loaded %d channel(s)", len(self.channels))
+        return self.channels
+
+    def get_channel(self, channel_id: str) -> Optional[Channel]:
+        return self._by_id.get(channel_id)
+
+    def _target_allowed(self, channel: Channel, target_url: str) -> bool:
+        parsed = urlparse(target_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+
+        cid = channel.id
+        allowed = self._allowed_hosts.setdefault(cid, set())
+        hostname = parsed.hostname.lower()
+
+        if hostname in allowed:
+            return True
+
+        if self._is_public_hostname(hostname):
+            # Hosts discovered as redirects or HLS child resources must only be
+            # added by the service after they are observed from a configured
+            # source response. Never accept an arbitrary client-supplied host.
+            return False
+
+        return False
+
+    def register_observed_host(self, channel: Channel, target_url: str) -> None:
+        hostname = urlparse(target_url).hostname
+        if hostname and self._is_public_hostname(hostname):
+            self._allowed_hosts.setdefault(channel.id, set()).add(hostname.lower())
+
+    async def fetch_segment(self, channel_id: str, target_url: str) -> Optional[bytes]:
+        channel = self.get_channel(channel_id)
+        if not channel or not self._client:
+            return None
+        if not self._target_allowed(channel, target_url):
+            LOG.warning("[%s] blocked unapproved segment host: %s", channel.name, urlparse(target_url).hostname)
+            return None
+
+        try:
+            self.register_observed_host(channel, target_url)
+            return await self._client.fetch_bytes(target_url, build_headers(channel))
+        except Exception as exc:
+            LOG.warning("[%s] segment fetch failed: %s", channel.name, exc)
+            return None
 
 
 def install_signals(loop: asyncio.AbstractEventLoop, event: asyncio.Event) -> None:
