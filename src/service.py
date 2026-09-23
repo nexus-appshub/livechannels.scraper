@@ -145,6 +145,10 @@ async def run_service() -> None:
         raise RuntimeError("No enabled channels configured")
 
     by_id = channel_lookup(channels)
+    allowed_hosts_by_channel: dict[str, set[str]] = {}
+    for channel in channels:
+        host = urlparse(channel.url).hostname
+        allowed_hosts_by_channel[channel_id(channel)] = {host.lower()} if host else set()
     stop = asyncio.Event()
 
     connector = aiohttp.TCPConnector(
@@ -201,9 +205,7 @@ async def run_service() -> None:
             requested_url = request.query.get("u")
             target = decode_url(requested_url) if requested_url else channel.url
 
-            parsed_target = urlparse(target)
-            configured_host = urlparse(channel.url).hostname
-            allowed_hosts = {configured_host.lower()} if configured_host else set()
+            allowed_hosts = allowed_hosts_by_channel.setdefault(cid, set())
 
             if not host_allowed(target, allowed_hosts):
                 raise web.HTTPForbidden(text="Target is not an allowed configured source")
@@ -232,6 +234,7 @@ async def run_service() -> None:
                         or ip.is_unspecified
                     ):
                         allowed_hosts.add(final_host.lower())
+                        allowed_hosts_by_channel[cid] = allowed_hosts
                 except (OSError, ValueError):
                     pass
 
@@ -282,8 +285,7 @@ async def run_service() -> None:
             except Exception as exc:
                 raise web.HTTPBadRequest(text="Invalid encoded URL") from exc
 
-            configured_host = urlparse(channel.url).hostname
-            allowed_hosts = {configured_host.lower()} if configured_host else set()
+            allowed_hosts = allowed_hosts_by_channel.setdefault(cid, set())
             if not host_allowed(target, allowed_hosts):
                 raise web.HTTPForbidden(text="Segment is outside the configured source")
 
