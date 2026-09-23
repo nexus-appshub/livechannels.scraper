@@ -277,6 +277,7 @@ async def handle_api_channels(_: web.Request) -> web.Response:
                 "name": ch.name,
                 "status": ch.health_status,
                 "gatewayUrl": f"/stream/{ch.id}/master.m3u8",
+                "sourceUrl": ch.url,
             }
             for ch in channel_manager.channels
         ],
@@ -358,31 +359,82 @@ async def init_app() -> web.Application:
 
     timeout = float(os.getenv("UPSTREAM_TIMEOUT", "10"))
     retries = int(os.getenv("UPSTREAM_RETRIES", "4"))
+    refresh_seconds = max(15, int(os.getenv("CONFIG_REFRESH_SECONDS", "60")))
 
     connector = aiohttp.TCPConnector(limit=50, limit_per_host=8, ttl_dns_cache=300)
     session = aiohttp.ClientSession(connector=connector)
     client = HLSClient(session, retries=retries, timeout=timeout)
 
     channel_manager.configure_client(client)
-    channels = await channel_manager.load_config()
+    await channel_manager.load_config()
 
     stop = asyncio.Event()
-    workers = [ChannelWorker(ch, client, stop, False) for ch in channels]
-    tasks = [
-        asyncio.create_task(worker.run(), name=f"channel:{worker.channel.name}")
-        for worker in workers
-    ]
+    tasks: dict[str, asyncio.Task] = {}
+
+    def signature(channels: list[Channel]) -> dict[str, str]:
+        return {ch.id: ch.url for ch in channels}
+
+    async def reconcile_workers(force: bool = False) -> None:
+        channels = channel_manager.channels
+        wanted = signature(channels)
+
+        for cid in list(tasks):
+            if cid not in wanted:
+                tasks[cid].cancel()
+                await asyncio.gather(tasks[cid], return_exceptions=True)
+                del tasks[cid]
+
+        existing = {cid for cid in tasks}
+        if force or existing != set(wanted):
+            # For a changed catalog, recreate workers so source URLs/headers are current.
+            for task in list(tasks.values()):
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
+            tasks.clear()
+
+            for channel in channels:
+                worker = ChannelWorker(channel, client, stop, False)
+                tasks[channel.id] = asyncio.create_task(
+                    worker.run(), name=f"channel:{channel.name}"
+                )
+
+    await reconcile_workers(force=True)
+
+    async def refresh_loop() -> None:
+        while not stop.is_set():
+            await asyncio.sleep(refresh_seconds)
+            try:
+                before = signature(channel_manager.channels)
+                await channel_manager.load_config()
+                after = signature(channel_manager.channels)
+
+                if before != after:
+                    await reconcile_workers(force=True)
+                    LOG.info("channel catalog changed; workers reconciled")
+                else:
+                    LOG.info("channel catalog refreshed; %d channel(s)", len(after))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("channel catalog refresh failed")
+
+    refresh_task = asyncio.create_task(refresh_loop(), name="channel-catalog-refresh")
 
     app["http_session"] = session
     app["hls_client"] = client
     app["stop_event"] = stop
     app["worker_tasks"] = tasks
+    app["refresh_task"] = refresh_task
 
     async def cleanup(_: web.Application) -> None:
         stop.set()
-        for task in tasks:
+        refresh_task.cancel()
+        await asyncio.gather(refresh_task, return_exceptions=True)
+        for task in list(tasks.values()):
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
         await session.close()
 
     app.on_cleanup.append(cleanup)
