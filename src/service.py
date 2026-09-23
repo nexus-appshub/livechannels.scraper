@@ -365,8 +365,12 @@ async def init_app() -> web.Application:
     session = aiohttp.ClientSession(connector=connector)
     client = HLSClient(session, retries=retries, timeout=timeout)
 
-    channel_manager.configure_client(client)
-    await channel_manager.load_config()
+    try:
+        channel_manager.configure_client(client)
+        await channel_manager.load_config()
+    except Exception:
+        await session.close()
+        raise
 
     stop = asyncio.Event()
     tasks: dict[str, asyncio.Task] = {}
