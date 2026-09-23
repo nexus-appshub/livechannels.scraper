@@ -481,6 +481,16 @@ class UniversalScraper:
 
             try:
                 playlist = m3u8.loads(body, uri=final_url)
+                if not playlist.is_variant and not streams:
+                    self._add(
+                        streams,
+                        seen,
+                        name=self._name_from_url(final_url),
+                        url=final_url,
+                        referer=final_url,
+                        category="HLS Media",
+                        source_page=final_url,
+                    )
                 if playlist.is_variant:
                     self._add(
                         streams,
