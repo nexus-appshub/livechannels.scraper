@@ -544,7 +544,29 @@ class ChannelManager:
                 LOG.exception("remote channel configuration failed")
                 channels = []
 
-        # Fallback to local file / CHANNELS_JSON if remote catalog is unavailable.
+        # Fallback to a URL stored in CHANNELS_JSON, then to a local JSON file.
+        if not channels:
+            channels_json = os.getenv("CHANNELS_JSON", "").strip()
+            if channels_json.startswith(("http://", "https://")):
+                try:
+                    timeout = float(os.getenv("REMOTE_CONFIG_TIMEOUT", "15"))
+                    if self._client is None:
+                        raise RuntimeError("HLS client is not initialized")
+                    channels = await fetch_remote_channels(
+                        self._client.session,
+                        channels_json,
+                        output_root,
+                        timeout,
+                    )
+                    if not channels:
+                        raise ValueError("CHANNELS_JSON URL returned 0 valid channel entries")
+                    self.last_config_error = None
+                    LOG.info("CHANNELS_JSON URL loaded %d channel(s)", len(channels))
+                except Exception as exc:
+                    self.last_config_error = str(exc)
+                    LOG.exception("CHANNELS_JSON URL fetch failed")
+                    channels = []
+
         if not channels:
             try:
                 channels = load_channels(config_path, output_root)
