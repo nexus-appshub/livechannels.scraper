@@ -81,6 +81,7 @@ def rewrite_manifest(
     if playlist.is_variant:
         for item in playlist.playlists:
             absolute = urljoin(final_url, item.uri)
+            channel_manager.register_observed_host(channel, absolute)
             if not safe_observed_child(channel, absolute):
                 raise web.HTTPBadGateway(
                     text="HLS child playlist host is not an approved source host"
@@ -89,6 +90,7 @@ def rewrite_manifest(
     else:
         for index, segment in enumerate(playlist.segments):
             absolute = urljoin(final_url, segment.uri)
+            channel_manager.register_observed_host(channel, absolute)
             if not safe_observed_child(channel, absolute):
                 raise web.HTTPBadGateway(
                     text="HLS segment host is not an approved source host"
@@ -415,13 +417,13 @@ async def init_app() -> web.Application:
 
                 if before != after:
                     await reconcile_workers(force=True)
-                    LOG.info("channel catalog changed; workers reconciled")
+                    logger.info("channel catalog changed; workers reconciled")
                 else:
-                    LOG.info("channel catalog refreshed; %d channel(s)", len(after))
+                    logger.info("channel catalog refreshed; %d channel(s)", len(after))
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOG.exception("channel catalog refresh failed")
+                logger.exception("channel catalog refresh failed")
 
     refresh_task = asyncio.create_task(refresh_loop(), name="channel-catalog-refresh")
 
