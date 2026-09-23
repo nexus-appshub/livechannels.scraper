@@ -1,519 +1,395 @@
 #!/usr/bin/env python3
-"""Deployment service with dashboard, channel API, and restricted HLS gateway.
-
-The gateway only proxies URLs belonging to configured channel sources.
-It is intentionally not an arbitrary/open URL proxy.
-"""
+"""LiveChannels dashboard + controlled HLS gateway."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import html
-import ipaddress
 import logging
 import os
-import json
-import socket
-from pathlib import Path
+from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
 import m3u8
 from aiohttp import web
 
-from scraper import AccessDeniedError, Channel, ChannelWorker, HLSClient, load_channels
+from scraper import (
+    AccessDeniedError,
+    Channel,
+    ChannelManager,
+    ChannelWorker,
+    HLSClient,
+    build_headers,
+)
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("livechannels.service")
+
+routes = web.RouteTableDef()
+channel_manager = ChannelManager()
 
 
-LOG = logging.getLogger("livechannels.service")
-
-async def fetch_remote_channels(
-    session: aiohttp.ClientSession,
-    config_url: str,
-    output_dir: Path,
-    timeout: float,
-) -> list[Channel]:
-    """Load a JSON or simple M3U channel catalog from a configured remote URL."""
-    parsed = urlparse(config_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("REMOTE_CONFIG_URL must be a valid http(s) URL")
-
-    async with session.get(
-        config_url,
-        allow_redirects=True,
-        timeout=aiohttp.ClientTimeout(total=timeout),
-        headers={"Accept": "application/json, text/plain, */*"},
-    ) as response:
-        response.raise_for_status()
-        body = await response.text(errors="replace")
-        content_type = (response.headers.get("Content-Type") or "").lower()
-
-    channels: list[Channel] = []
-
-    if "json" in content_type or body.lstrip().startswith("{"):
-        data = json.loads(body)
-        raw_items = data.get("channels", data if isinstance(data, list) else [])
-        for item in raw_items:
-            if not isinstance(item, dict) or not item.get("url") or not item.get("name"):
-                continue
-            headers = item.get("headers") or {}
-            channels.append(
-                Channel(
-                    name=str(item["name"]),
-                    url=str(item["url"]),
-                    output_dir=output_dir / str(item["name"]),
-                    headers={str(k): str(v) for k, v in headers.items()},
-                    enabled=bool(item.get("enabled", True)),
-                    poll_seconds=float(item["poll_seconds"]) if item.get("poll_seconds") else None,
-                    max_bandwidth=int(item["max_bandwidth"]) if item.get("max_bandwidth") else None,
-                )
-            )
-    else:
-        lines = [line.strip() for line in body.splitlines() if line.strip()]
-        pending_name: str | None = None
-        for line in lines:
-            if line.startswith("#EXTINF:"):
-                pending_name = line.split(",", 1)[1].strip() if "," in line else None
-            elif not line.startswith("#") and pending_name:
-                channels.append(
-                    Channel(
-                        name=pending_name,
-                        url=urljoin(config_url, line),
-                        output_dir=output_dir / pending_name,
-                        headers={},
-                        enabled=True,
-                    )
-                )
-                pending_name = None
-
-    return channels
-
-
-def channel_id(channel: Channel) -> str:
-    import re
-
-    return re.sub(r"[^a-z0-9]+", "-", channel.name.lower()).strip("-") or "channel"
-
-
-def encode_url(url: str) -> str:
+def encode_target(url: str) -> str:
     return base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def decode_url(value: str) -> str:
+def decode_target(value: str) -> str:
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode((value + padding).encode("ascii")).decode("utf-8")
 
 
-def host_allowed(url: str, allowed_hosts: set[str]) -> bool:
-    parsed = urlparse(url)
+def origin_for(request: web.Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+    scheme = forwarded or request.scheme
+    return f"{scheme}://{request.host}"
+
+
+def is_hls_body(body: str) -> bool:
+    return body.lstrip().startswith("#EXTM3U")
+
+
+def safe_source_target(channel: Channel, target: str) -> bool:
+    parsed = urlparse(target)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return False
 
-    host = parsed.hostname.lower()
-    if host in allowed_hosts:
-        return True
+    # Only explicitly configured source hosts are accepted here.
+    allowed = channel_manager._allowed_hosts.setdefault(channel.id, set())
+    return parsed.hostname.lower() in allowed
 
-    try:
-        ip = ipaddress.ip_address(host)
-        return not (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
+
+def rewrite_manifest(
+    channel: Channel,
+    final_url: str,
+    body: str,
+    base: str,
+) -> str:
+    playlist = m3u8.loads(body, uri=final_url)
+
+    if playlist.keys and any(key is not None for key in playlist.keys):
+        raise web.HTTPBadGateway(
+            text="Encrypted/protected HLS is not handled by this gateway"
         )
-    except ValueError:
-        # For a hostname, require explicit allowlisting.
+
+    cid = channel.id
+
+    if playlist.is_variant:
+        for item in playlist.playlists:
+            absolute = urljoin(final_url, item.uri)
+            if not safe_observed_child(channel, absolute):
+                raise web.HTTPBadGateway(
+                    text="HLS child playlist host is not an approved source host"
+                )
+            item.uri = f"{base}/stream/{cid}/master.m3u8?u={encode_target(absolute)}"
+    else:
+        for index, segment in enumerate(playlist.segments):
+            absolute = urljoin(final_url, segment.uri)
+            if not safe_observed_child(channel, absolute):
+                raise web.HTTPBadGateway(
+                    text="HLS segment host is not an approved source host"
+                )
+            segment.uri = f"{base}/stream/{cid}/segment?u={encode_target(absolute)}"
+
+    return playlist.dumps()
+
+
+def safe_observed_child(channel: Channel, target: str) -> bool:
+    parsed = urlparse(target)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return False
 
+    hostname = parsed.hostname.lower()
+    allowed = channel_manager._allowed_hosts.setdefault(channel.id, set())
 
-def channel_lookup(channels: list[Channel]) -> dict[str, Channel]:
-    return {channel_id(ch): ch for ch in channels}
+    if hostname in allowed:
+        return True
+
+    # Permit a public host only after it has been observed in a source response.
+    # The service caller adds redirected response hosts to the same allowlist.
+    if channel_manager._is_public_hostname(hostname):
+        return False
+
+    return False
 
 
-def build_dashboard(channels: list[Channel], request: web.Request) -> str:
-    base = str(request.url.origin())
-    rows = []
-
-    if not channels:
-        rows.append(
-            """
-            <tr>
-              <td colspan="3">
-                <strong>No channels configured</strong><br><br>
-                Add the Railway/Render environment variable
-                <code>CHANNELS_JSON</code> containing your channel configuration,
-                then redeploy/restart the service.
-              </td>
-            </tr>
-            """
-        )
-
-    for channel in channels:
-        cid = channel_id(channel)
-        stream = f"{base}/stream/{cid}/master.m3u8"
-        stream_attr = html.escape(stream, quote=True)
-        rows.append(
-            f"""
-            <tr>
-              <td><strong>{html.escape(channel.name)}</strong></td>
-              <td>
-                <code>{stream_attr}</code><br>
-                <button class="copy-btn" data-stream="{stream_attr}">Copy M3U8</button>
-                <button class="play-btn" data-stream="{stream_attr}">Play</button>
-                <a href="{stream_attr}" target="_blank" rel="noopener">Open</a>
-              </td>
-            </tr>
-            """
-        )
-
-    return f"""<!doctype html>
-<html>
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LiveChannels Scraper</title>
+<meta charset="UTF-8">
+<title>LiveChannels Gateway</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <style>
-body{{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#101114;color:#eee;margin:0}}
-main{{max-width:1200px;margin:40px auto;padding:0 20px}}
-h1{{margin-bottom:6px}}
-.sub{{color:#9aa0a6;margin-bottom:24px}}
-table{{width:100%;border-collapse:collapse;background:#181a20;border-radius:12px;overflow:hidden}}
-th,td{{padding:14px;text-align:left;border-bottom:1px solid #2a2d35;vertical-align:top}}
-code{{word-break:break-all;color:#a8d8ff}}
-button,a{{display:inline-block;margin:4px 4px 0 0;padding:8px 12px;border-radius:8px;border:0;background:#2a6df4;color:#fff;text-decoration:none;cursor:pointer}}
-a{{background:#3a3f4b}}
-.player{{margin-top:24px;background:#181a20;border-radius:12px;padding:14px}}
-video{{width:100%;max-height:65vh;background:#000;border-radius:8px}}
-.note{{margin-top:22px;padding:14px;background:#181a20;border-radius:10px;color:#b7bcc6}}
-.status{{margin-top:8px;color:#aeb5c0}}
+:root { --bg:#121212; --card:#1e1e1e; --text:#e0e0e0; --muted:#9e9e9e; --accent:#0277bd; }
+* { box-sizing:border-box; }
+body { font-family:system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:20px; }
+.header { margin-bottom:25px; border-bottom:1px solid #333; padding-bottom:15px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:20px; }
+.card { background:var(--card); padding:18px; border-radius:10px; border:1px solid #333; box-shadow:0 4px 6px rgba(0,0,0,.3); }
+.card h3 { margin:0 0 15px; display:flex; justify-content:space-between; gap:10px; align-items:center; font-size:1.05rem; }
+.status { font-size:.72rem; padding:4px 10px; border-radius:20px; font-weight:bold; text-transform:uppercase; }
+.status.healthy,.status.starting { background:rgba(27,94,32,.3); color:#81c784; border:1px solid #2e7d32; }
+.status.degraded { background:rgba(245,127,23,.3); color:#fff176; border:1px solid #fbc02d; }
+.status.down { background:rgba(183,28,28,.3); color:#e57373; border:1px solid #c62828; }
+.status.unknown { background:rgba(90,90,90,.25); color:#bdbdbd; border:1px solid #616161; }
+.url-box { background:#000; padding:10px; font-family:monospace; font-size:.78rem; overflow-x:auto; margin-bottom:15px; border-radius:6px; color:#a5d6a7; white-space:nowrap; }
+.btn-group { display:flex; gap:10px; }
+.btn { flex:1; padding:8px 12px; border:none; border-radius:6px; cursor:pointer; color:#fff; background:var(--accent); font-size:.84rem; font-weight:500; text-align:center; text-decoration:none; }
+.btn-play { background:#2e7d32; }
+.btn-open { background:#424242; }
+#player-modal { display:none; position:fixed; inset:0; width:100%; height:100%; background:rgba(0,0,0,.95); z-index:1000; justify-content:center; align-items:center; flex-direction:column; padding:20px; }
+video { width:100%; max-width:900px; aspect-ratio:16/9; background:#000; border-radius:8px; }
+.close-btn { margin-top:20px; max-width:200px; flex:none; }
+.empty { padding:30px; border:1px dashed #444; border-radius:10px; color:var(--muted); }
 </style>
 </head>
 <body>
-<main>
-<h1>LiveChannels Scraper</h1>
-<div class="sub">{len(channels)} configured channel(s)</div>
-<table>
-<thead><tr><th>Channel</th><th>Gateway M3U8</th></tr></thead>
-<tbody>{''.join(rows)}</tbody>
-</table>
-
-<div class="player">
-  <video id="player" controls playsinline></video>
-  <div id="playerStatus" class="status">Choose Play on a channel.</div>
+<div class="header">
+<h1 style="margin:0 0 5px;">LiveChannels Gateway</h1>
+<p style="margin:0;color:#9e9e9e;">
+Active Channels: <strong id="channel-count" style="color:#fff;">0</strong>
+| Network Status: <span id="sys-status" style="color:#81c784;">Online</span>
+</p>
 </div>
 
-<div class="note">
-The displayed URLs are generated by this application's controlled HLS gateway.
-Only configured channel sources are eligible; this service is not an arbitrary URL proxy.
+<div class="grid" id="channel-grid">
+<div class="empty">Loading channels...</div>
 </div>
-</main>
+
+<div id="player-modal">
+<video id="video-player" controls playsinline></video>
+<button class="btn close-btn" onclick="closePlayer()">Close Player</button>
+</div>
 
 <script>
-let activeHls = null;
+async function fetchChannels() {
+  try {
+    const res = await fetch('/api/channels', {cache:'no-store'});
+    const data = await res.json();
+    document.getElementById('channel-count').innerText = data.channels.length;
 
-function setStatus(message) {{
-  document.getElementById("playerStatus").textContent = message;
-}}
+    const grid = document.getElementById('channel-grid');
+    if (!data.channels.length) {
+      grid.innerHTML = '<div class="empty">No channels configured. Set REMOTE_CONFIG_URL or CHANNELS_JSON and redeploy.</div>';
+      return;
+    }
 
-function playHls(url) {{
-  const video = document.getElementById("player");
+    grid.innerHTML = data.channels.map(ch => {
+      const safeName = escapeHtml(ch.name);
+      const fullUrl = new URL(ch.gatewayUrl, window.location.origin).toString();
+      const statusClass = (ch.status || 'UNKNOWN').toLowerCase();
+      return `
+        <div class="card">
+          <h3>${safeName}<span class="status ${statusClass}">${ch.status || 'UNKNOWN'}</span></h3>
+          <div class="url-box">${escapeHtml(fullUrl)}</div>
+          <div class="btn-group">
+            <button class="btn" onclick="copyToClipboard(this.dataset.url)" data-url="${escapeAttr(fullUrl)}">Copy M3U8</button>
+            <button class="btn btn-play" onclick="playStream(this.dataset.url)" data-url="${escapeAttr(fullUrl)}">Play</button>
+            <a href="${escapeAttr(fullUrl)}" target="_blank" class="btn btn-open" rel="noopener">Open</a>
+          </div>
+        </div>`;
+    }).join('');
+  } catch (err) {
+    document.getElementById('sys-status').innerText = 'Degraded / API Error';
+    document.getElementById('sys-status').style.color = '#e57373';
+  }
+}
 
-  if (activeHls) {{
-    activeHls.destroy();
-    activeHls = null;
-  }}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+function escapeAttr(s) { return escapeHtml(s); }
 
-  setStatus("Loading HLS stream...");
+async function copyToClipboard(text) {
+  await navigator.clipboard.writeText(text);
+}
 
-  if (video.canPlayType("application/vnd.apple.mpegurl")) {{
+let hls = null;
+function playStream(url) {
+  const modal = document.getElementById('player-modal');
+  const video = document.getElementById('video-player');
+  modal.style.display = 'flex';
+
+  if (window.Hls && Hls.isSupported()) {
+    if (hls) hls.destroy();
+    hls = new Hls({maxBufferLength:30, liveSyncDuration:3});
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    return;
+  }
+
+  if (video.canPlayType('application/vnd.apple.mpegurl')) {
     video.src = url;
-    video.play().then(
-      () => setStatus("Playing"),
-      () => setStatus("Stream loaded; press Play if autoplay is blocked")
-    );
-    return;
-  }}
+    video.play().catch(() => {});
+  }
+}
 
-  if (window.Hls && Hls.isSupported()) {{
-    activeHls = new Hls({{
-      enableWorker: true,
-      lowLatencyMode: true,
-      backBufferLength: 30
-    }});
+function closePlayer() {
+  const modal = document.getElementById('player-modal');
+  const video = document.getElementById('video-player');
+  if (hls) { hls.destroy(); hls = null; }
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  modal.style.display = 'none';
+}
 
-    activeHls.loadSource(url);
-    activeHls.attachMedia(video);
-
-    activeHls.on(Hls.Events.MANIFEST_PARSED, function() {{
-      setStatus("Manifest loaded");
-      video.play().then(
-        () => setStatus("Playing"),
-        () => setStatus("Manifest loaded; press Play if autoplay is blocked")
-      );
-    }});
-
-    activeHls.on(Hls.Events.ERROR, function(event, data) {{
-      if (data.fatal) {{
-        setStatus("Playback error: " + (data.details || "unknown HLS error"));
-      }}
-    }});
-    return;
-  }}
-
-  setStatus("This browser does not support HLS playback.");
-}}
-
-document.querySelectorAll(".copy-btn").forEach(function(button) {{
-  button.addEventListener("click", async function() {{
-    await navigator.clipboard.writeText(button.dataset.stream);
-    setStatus("M3U8 URL copied");
-  }});
-}});
-
-document.querySelectorAll(".play-btn").forEach(function(button) {{
-  button.addEventListener("click", function() {{
-    playHls(button.dataset.stream);
-  }});
-}});
+fetchChannels();
+setInterval(fetchChannels, 15000);
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
-async def run_service() -> None:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+@routes.get("/")
+async def handle_root(_: web.Request) -> web.Response:
+    return web.Response(text=HTML_TEMPLATE, content_type="text/html")
 
-    output_dir = Path(os.getenv("OUTPUT_DIR", "data"))
-    config_path = Path(os.getenv("CHANNEL_CONFIG", "channels.json"))
-    append_ts = os.getenv("APPEND_TS", "false").lower() in {"1", "true", "yes", "on"}
+
+@routes.get("/health")
+async def handle_health(_: web.Request) -> web.Response:
+    configured = channel_manager.is_configured
+    return web.json_response({
+        "status": "ok" if configured else "degraded",
+        "service": "livechannels-scraper",
+        "workers": len(channel_manager.channels),
+        "configured": configured,
+    })
+
+
+@routes.get("/api/channels")
+async def handle_api_channels(_: web.Request) -> web.Response:
+    return web.json_response({
+        "success": True,
+        "channels": [
+            {
+                "id": ch.id,
+                "name": ch.name,
+                "status": ch.health_status,
+                "gatewayUrl": f"/stream/{ch.id}/master.m3u8",
+            }
+            for ch in channel_manager.channels
+        ],
+    })
+
+
+@routes.get("/stream/{channel_id}/master.m3u8")
+async def handle_master_m3u8(request: web.Request) -> web.StreamResponse:
+    cid = request.match_info["channel_id"]
+    channel = channel_manager.get_channel(cid)
+    if not channel:
+        raise web.HTTPNotFound(text="Channel not found")
+
+    encoded = request.query.get("u")
+    target = decode_target(encoded) if encoded else channel.url
+
+    if not safe_source_target(channel, target):
+        raise web.HTTPForbidden(text="Source is not configured for this channel")
 
     try:
-        channels = load_channels(config_path, output_dir)
-    except FileNotFoundError:
-        channels = []
-    except json.JSONDecodeError as exc:
-        LOG.error("Invalid channel configuration JSON: %s", exc)
-        channels = []
+        headers = build_headers(channel)
+        body, final_url = await request.app["hls_client"].fetch_text(target, headers)
 
-    # Load remote channel catalog when no local/environment config is present.
-    remote_config_url = os.getenv("REMOTE_CONFIG_URL", "").strip()
-    if not channels and remote_config_url:
-        try:
-            bootstrap_timeout = float(os.getenv("REMOTE_CONFIG_TIMEOUT", "15"))
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=bootstrap_timeout)
-            ) as bootstrap_session:
-                channels = await fetch_remote_channels(
-                    bootstrap_session,
-                    remote_config_url,
-                    output_dir,
-                    bootstrap_timeout,
-                )
-            LOG.info("loaded %d channel(s) from REMOTE_CONFIG_URL", len(channels))
-        except Exception:
-            LOG.exception("remote channel configuration could not be loaded")
+        final_host = urlparse(final_url).hostname
+        if final_host:
+            channel_manager.register_observed_host(channel, final_url)
 
-    by_id = channel_lookup(channels)
-    allowed_hosts_by_channel: dict[str, set[str]] = {}
-    for channel in channels:
-        host = urlparse(channel.url).hostname
-        allowed_hosts_by_channel[channel_id(channel)] = {host.lower()} if host else set()
-    stop = asyncio.Event()
+        if not is_hls_body(body):
+            raise web.HTTPBadGateway(text="Configured source did not return an HLS playlist")
 
-    connector = aiohttp.TCPConnector(
-        limit=50,
-        limit_per_host=8,
-        ttl_dns_cache=300,
+        manifest = rewrite_manifest(channel, final_url, body, origin_for(request))
+        return web.Response(
+            text=manifest,
+            content_type="application/vnd.apple.mpegurl",
+            headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"},
+        )
+    except AccessDeniedError as exc:
+        raise web.HTTPBadGateway(text=str(exc)) from exc
+
+
+@routes.get("/stream/{channel_id}/segment")
+async def handle_segment(request: web.Request) -> web.Response:
+    cid = request.match_info["channel_id"]
+    encoded = request.query.get("u")
+    channel = channel_manager.get_channel(cid)
+
+    if not channel:
+        raise web.HTTPNotFound(text="Channel not found")
+    if not encoded:
+        raise web.HTTPBadRequest(text="Missing segment URL")
+
+    try:
+        target = decode_target(encoded)
+    except Exception as exc:
+        raise web.HTTPBadRequest(text="Invalid segment URL") from exc
+
+    if not safe_source_target(channel, target):
+        raise web.HTTPForbidden(text="Segment source is not approved")
+
+    data = await channel_manager.fetch_segment(cid, target)
+    if not data:
+        raise web.HTTPBadGateway(text="Upstream segment failure")
+
+    content_type = (
+        "video/mp2t"
+        if target.lower().split("?", 1)[0].endswith(".ts")
+        else "application/octet-stream"
     )
+    return web.Response(
+        body=data,
+        content_type=content_type,
+        headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"},
+    )
+
+
+async def init_app() -> web.Application:
+    app = web.Application(client_max_size=8 * 1024 * 1024)
+    app.add_routes(routes)
 
     timeout = float(os.getenv("UPSTREAM_TIMEOUT", "10"))
     retries = int(os.getenv("UPSTREAM_RETRIES", "4"))
 
-    async with aiohttp.ClientSession(connector=connector) as session:
-        client = HLSClient(session, retries=retries, timeout=timeout)
+    connector = aiohttp.TCPConnector(limit=50, limit_per_host=8, ttl_dns_cache=300)
+    session = aiohttp.ClientSession(connector=connector)
+    client = HLSClient(session, retries=retries, timeout=timeout)
 
-        workers = [ChannelWorker(channel, client, stop, append_ts) for channel in channels]
-        tasks = [
-            asyncio.create_task(worker.run(), name=f"channel:{channel.name}")
-            for worker, channel in zip(workers, channels)
-        ]
+    channel_manager.configure_client(client)
+    channels = await channel_manager.load_config()
 
-        async def health(_: web.Request) -> web.Response:
-            return web.json_response({
-                "status": "ok" if channels else "degraded",
-                "service": "livechannels-scraper",
-                "workers": len(channels),
-                "configured": bool(channels),
-            })
+    stop = asyncio.Event()
+    workers = [ChannelWorker(ch, client, stop, False) for ch in channels]
+    tasks = [
+        asyncio.create_task(worker.run(), name=f"channel:{worker.channel.name}")
+        for worker in workers
+    ]
 
-        async def api_channels(_: web.Request) -> web.Response:
-            return web.json_response({
-                "success": True,
-                "channels": [
-                    {
-                        "id": channel_id(ch),
-                        "name": ch.name,
-                        "sourceUrl": ch.url,
-                        "gatewayUrl": f"/stream/{channel_id(ch)}/master.m3u8",
-                    }
-                    for ch in channels
-                ],
-            })
+    app["http_session"] = session
+    app["hls_client"] = client
+    app["stop_event"] = stop
+    app["worker_tasks"] = tasks
 
-        async def root(request: web.Request) -> web.Response:
-            return web.Response(
-                text=build_dashboard(channels, request),
-                content_type="text/html",
-            )
+    async def cleanup(_: web.Application) -> None:
+        stop.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await session.close()
 
-        async def stream(request: web.Request) -> web.StreamResponse:
-            cid = request.match_info["channel_id"]
-            channel = by_id.get(cid)
-            if not channel:
-                raise web.HTTPNotFound(text="Unknown channel")
-
-            requested_url = request.query.get("u")
-            target = decode_url(requested_url) if requested_url else channel.url
-
-            allowed_hosts = allowed_hosts_by_channel.setdefault(cid, set())
-
-            if not host_allowed(target, allowed_hosts):
-                raise web.HTTPForbidden(text="Target is not an allowed configured source")
-
-            try:
-                body, final_url = await client.fetch_text(target, {
-                    "Accept": "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-                    **{k: v for k, v in channel.headers.items() if k.lower() != "host"},
-                })
-            except AccessDeniedError as exc:
-                raise web.HTTPBadGateway(text=str(exc)) from exc
-
-            # Add the final redirect hostname to the in-request allowlist only when
-            # it is a publicly routable hostname reached from an allowed source.
-            final_host = urlparse(final_url).hostname
-            if final_host:
-                try:
-                    addr = socket.gethostbyname(final_host)
-                    ip = ipaddress.ip_address(addr)
-                    if not (
-                        ip.is_private
-                        or ip.is_loopback
-                        or ip.is_link_local
-                        or ip.is_reserved
-                        or ip.is_multicast
-                        or ip.is_unspecified
-                    ):
-                        allowed_hosts.add(final_host.lower())
-                        allowed_hosts_by_channel[cid] = allowed_hosts
-                except (OSError, ValueError):
-                    pass
-
-            if body.lstrip().startswith("#EXTM3U"):
-                playlist = m3u8.loads(body, uri=final_url)
-
-                # Refuse encrypted/protected playlists rather than attempting to
-                # bypass or unwrap keys.
-                if playlist.keys and any(key is not None for key in playlist.keys):
-                    raise web.HTTPBadGateway(text="Encrypted/protected HLS is not handled")
-
-                if playlist.is_variant:
-                    for item in playlist.playlists:
-                        absolute = urljoin(final_url, item.uri)
-                        item.uri = (
-                            f"/stream/{cid}/master.m3u8?u={encode_url(absolute)}"
-                        )
-                else:
-                    for index, segment in enumerate(playlist.segments):
-                        absolute = urljoin(final_url, segment.uri)
-                        if not host_allowed(absolute, allowed_hosts):
-                            raise web.HTTPBadGateway(
-                                text=f"Segment host is outside the configured source: {urlparse(absolute).hostname}"
-                            )
-                        segment.uri = f"/stream/{cid}/segment?u={encode_url(absolute)}"
-
-                rendered = playlist.dumps()
-                return web.Response(
-                    body=rendered.encode("utf-8"),
-                    content_type="application/vnd.apple.mpegurl",
-                    headers={"Cache-Control": "no-store"},
-                )
-
-            raise web.HTTPBadGateway(text="Configured source did not return an HLS playlist")
-
-        async def segment(request: web.Request) -> web.StreamResponse:
-            cid = request.match_info["channel_id"]
-            channel = by_id.get(cid)
-            if not channel:
-                raise web.HTTPNotFound(text="Unknown channel")
-
-            encoded = request.query.get("u")
-            if not encoded:
-                raise web.HTTPBadRequest(text="Missing segment URL")
-
-            try:
-                target = decode_url(encoded)
-            except Exception as exc:
-                raise web.HTTPBadRequest(text="Invalid encoded URL") from exc
-
-            allowed_hosts = allowed_hosts_by_channel.setdefault(cid, set())
-            if not host_allowed(target, allowed_hosts):
-                raise web.HTTPForbidden(text="Segment is outside the configured source")
-
-            try:
-                payload = await client.fetch_bytes(
-                    target,
-                    {
-                        "Accept": "*/*",
-                        **{k: v for k, v in channel.headers.items() if k.lower() != "host"},
-                    },
-                )
-            except AccessDeniedError as exc:
-                raise web.HTTPBadGateway(text=str(exc)) from exc
-
-            return web.Response(
-                body=payload,
-                content_type="video/mp2t"
-                if target.lower().split("?", 1)[0].endswith(".ts")
-                else "application/octet-stream",
-                headers={"Cache-Control": "no-store"},
-            )
-
-        app = web.Application(client_max_size=2 * 1024 * 1024)
-        app.router.add_get("/", root)
-        app.router.add_get("/health", health)
-        app.router.add_get("/api/channels", api_channels)
-        app.router.add_get("/stream/{channel_id}/master.m3u8", stream)
-        app.router.add_get("/stream/{channel_id}/segment", segment)
-
-        runner = web.AppRunner(app)
-        await runner.setup()
-
-        port = int(os.getenv("PORT", "8080"))
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-
-        LOG.info("dashboard listening on 0.0.0.0:%s", port)
-        LOG.info("configured channels: %d", len(channels))
-
-        try:
-            await asyncio.Event().wait()
-        finally:
-            stop.set()
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await runner.cleanup()
-
-
-def main() -> None:
-    asyncio.run(run_service())
+    app.on_cleanup.append(cleanup)
+    return app
 
 
 if __name__ == "__main__":
-    main()
+    port = int(os.getenv("PORT", "8080"))
+    logger.info("Starting LiveChannels Gateway on port %s", port)
+    web.run_app(init_app(), host="0.0.0.0", port=port)
