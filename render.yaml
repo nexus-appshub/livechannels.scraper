@@ -1,0 +1,21 @@
+services:
+  - type: worker
+    name: livechannels-scraper
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python src/service.py
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.10"
+      - key: OUTPUT_DIR
+        value: data
+      - key: APPEND_TS
+        value: "false"
+      - key: UPSTREAM_TIMEOUT
+        value: "10"
+      - key: UPSTREAM_RETRIES
+        value: "4"
+      - key: CHANNELS_JSON
+        sync: false
