@@ -518,16 +518,13 @@ class ChannelManager:
     async def load_config(self) -> list[Channel]:
         output_root = Path(os.getenv("OUTPUT_DIR", "data"))
         config_path = Path(os.getenv("CHANNEL_CONFIG", "channels.json"))
-
-        try:
-            channels = load_channels(config_path, output_root)
-        except FileNotFoundError:
-            channels = []
-        except json.JSONDecodeError:
-            channels = []
-
         remote_url = os.getenv("REMOTE_CONFIG_URL", "").strip()
-        if not channels and remote_url:
+
+        channels: list[Channel] = []
+
+        # When REMOTE_CONFIG_URL is configured, prefer it so the deployed
+        # dashboard automatically follows the remote catalog.
+        if remote_url:
             try:
                 timeout = float(os.getenv("REMOTE_CONFIG_TIMEOUT", "15"))
                 async with aiohttp.ClientSession(
@@ -536,9 +533,20 @@ class ChannelManager:
                     channels = await fetch_remote_channels(
                         session, remote_url, output_root, timeout
                     )
+                self.last_config_error = None
             except Exception as exc:
                 self.last_config_error = str(exc)
                 LOG.exception("remote channel configuration failed")
+                channels = []
+
+        # Fallback to local file / CHANNELS_JSON if remote catalog is unavailable.
+        if not channels:
+            try:
+                channels = load_channels(config_path, output_root)
+            except FileNotFoundError:
+                channels = []
+            except json.JSONDecodeError as exc:
+                self.last_config_error = f"Invalid JSON: {exc}"
                 channels = []
 
         self.channels = [ch for ch in channels if ch.enabled]
@@ -564,7 +572,9 @@ class ChannelManager:
 
         self.is_configured = bool(self.channels)
         self.last_config_at = asyncio.get_running_loop().time()
-        self.last_config_error = None
+        if self.is_configured:
+            self.last_config_error = None
+
         LOG.info("loaded %d channel(s)", len(self.channels))
         return self.channels
 
