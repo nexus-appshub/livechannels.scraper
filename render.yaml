@@ -1,10 +1,11 @@
 services:
-  - type: worker
+  - type: web
     name: livechannels-scraper
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python src/service.py
+    healthCheckPath: /health
     autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
@@ -17,5 +18,7 @@ services:
         value: "10"
       - key: UPSTREAM_RETRIES
         value: "4"
+      - key: LOG_LEVEL
+        value: "INFO"
       - key: CHANNELS_JSON
         sync: false
