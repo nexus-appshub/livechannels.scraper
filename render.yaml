@@ -22,3 +22,7 @@ services:
         value: "INFO"
       - key: CHANNELS_JSON
         sync: false
+      - key: REMOTE_CONFIG_URL
+        sync: false
+      - key: REMOTE_CONFIG_TIMEOUT
+        value: "15"
