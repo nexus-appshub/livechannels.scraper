@@ -10,6 +10,7 @@ import json
 import logging
 import random
 import signal
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -357,7 +358,15 @@ async def wait_or_stop(event: asyncio.Event, seconds: float) -> None:
 
 
 def load_channels(path: Path, output_root: Path) -> list[Channel]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        raw = os.getenv("CHANNELS_JSON", "").strip()
+        if not raw:
+            raise FileNotFoundError(
+                f"{path} not found and CHANNELS_JSON is not configured"
+            )
+        data = json.loads(raw)
     result: list[Channel] = []
 
     for item in data.get("channels", []):
