@@ -5,10 +5,11 @@ Python continuous HLS/M3U8 channel ingester for streams you are authorized to ac
 ## What is in this repo
 
 - `src/scraper.py` — core continuous HLS/M3U8 -> TS worker.
-- `src/service.py` — production deployment entrypoint with a lightweight `/health` endpoint.
+- `src/service.py` — production dashboard, controlled HLS gateway, remote catalog loader, and Universal URL Scraper API.
+- `src/universal.py` — generic public URL -> HLS/M3U/M3U8 discovery engine with HTML, script, media-tag, playlist, and iframe scanning.
 - `Dockerfile` — used automatically by Railway and supported by Render.
 - `railway.json` — Railway config with Docker build, health check, and automatic restart policy.
-- `render.yaml` — Render Background Worker configuration.
+- `render.yaml` — Render Web Service configuration for the dashboard/API.
 - `channels.example.json` — safe configuration template; real stream URLs should not be committed.
 
 ## Deploy to Railway
@@ -55,9 +56,7 @@ Railway currently supports GitHub autodeploys and Dockerfile-based deployments. 
 
 ## Deploy to Render
 
-For a scraper that must run continuously, use a **Background Worker**, not a Free Web Service.
-
-Render documents Background Workers as continuously running services. Free instances are not available for Background Workers, while Free Web Services can spin down after 15 minutes without inbound traffic.
+The included `render.yaml` is a **Web Service** because the project exposes a public dashboard and API. For long-running scraping, use a paid service/plan appropriate for continuous execution and persistent storage where needed.
 
 1. In Render, connect GitHub.
 2. Select this repository.
@@ -117,6 +116,30 @@ If `channels.json` is not present, `src/scraper.py` and `src/service.py` read `C
 For a remotely managed catalog, set `REMOTE_CONFIG_URL` to an authorized/public JSON or M3U catalog. The service fetches it at startup when no local/configured channel list is available. JSON should contain a `channels` array; simple M3U catalogs with `#EXTINF` entries are also accepted.
 
 Do not put credentials, private cookies, bearer tokens, or other secrets into Git.
+
+## Universal URL Scraper
+
+Open the deployed website and choose **Universal URL Scraper**. Enter a public target URL and press **Deep Scan**. The results are automatically shown in **Streams, M3U8 & Logs** with per-stream Copy, Play, and Open actions, plus bulk M3U export.
+
+The API is:
+
+```text
+POST /api/deep-scrape
+Content-Type: application/json
+
+{"url":"https://example.com/playlist.m3u8"}
+```
+
+The scanner supports public M3U/M3U8 playlists, HTML media/source tags, common player configuration patterns, external script URLs, and one level of iframe crawling. It rejects private/local network targets and does not bypass authentication, DRM, signed URLs, anti-bot challenges, or other access controls.
+
+Optional environment variables:
+
+```text
+UNIVERSAL_TIMEOUT=12
+UNIVERSAL_MAX_IFRAMES=10
+UNIVERSAL_MAX_SCRIPTS=12
+CONFIG_REFRESH_SECONDS=60
+```
 
 ## Continuous TS behavior
 
