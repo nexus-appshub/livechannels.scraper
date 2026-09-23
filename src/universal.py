@@ -22,15 +22,15 @@ import m3u8
 
 
 MEDIA_RE = re.compile(
-    r"https?://[^\s"'<>\\]+\.(?:m3u8|m3u|mp4|ts|m4s)(?:\?[^\s"'<>\\]*)?",
+    r'''https?://[^\s"'<>\\]+\.(?:m3u8|m3u|mp4|ts|m4s)(?:\?[^\s"'<>\\]*)?''',
     re.IGNORECASE,
 )
 HLS_PATH_RE = re.compile(
-    r"https?://[^\s"'<>\\]*(?:/hls/|/live/|/stream/)[^\s"'<>\\]+",
+    r'''https?://[^\s"'<>\\]*(?:/hls/|/live/|/stream/)[^\s"'<>\\]+''',
     re.IGNORECASE,
 )
 PLAYER_KEY_RE = re.compile(
-    r"["'](?:file|source|src|hls|m3u8|manifest|stream|url)["']\s*:\s*["']([^"']+)["']",
+    r'''["'](?:file|source|src|hls|m3u8|manifest|stream|url)["']\s*:\s*["']([^"']+)["']''',
     re.IGNORECASE,
 )
 
