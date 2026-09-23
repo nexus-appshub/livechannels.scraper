@@ -21,6 +21,8 @@ Python continuous HLS/M3U8 channel ingester for streams you are authorized to ac
 
 ```text
 CHANNELS_JSON=<your channel configuration JSON>
+REMOTE_CONFIG_URL=<authorized/public JSON or M3U catalog URL>
+REMOTE_CONFIG_TIMEOUT=15
 ```
 
 You can also set:
@@ -111,6 +113,8 @@ Example:
 ```
 
 If `channels.json` is not present, `src/scraper.py` and `src/service.py` read `CHANNELS_JSON` from the environment.
+
+For a remotely managed catalog, set `REMOTE_CONFIG_URL` to an authorized/public JSON or M3U catalog. The service fetches it at startup when no local/configured channel list is available. JSON should contain a `channels` array; simple M3U catalogs with `#EXTINF` entries are also accepted.
 
 Do not put credentials, private cookies, bearer tokens, or other secrets into Git.
 
