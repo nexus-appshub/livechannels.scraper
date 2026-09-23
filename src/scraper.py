@@ -518,7 +518,12 @@ class ChannelManager:
     async def load_config(self) -> list[Channel]:
         output_root = Path(os.getenv("OUTPUT_DIR", "data"))
         config_path = Path(os.getenv("CHANNEL_CONFIG", "channels.json"))
-        # Support the canonical name plus common deployment aliases.\n        remote_url = next((\n            os.getenv(name, "").strip()\n            for name in ("REMOTE_CONFIG_URL", "CHANNELS_URL", "CHANNELS_CONFIG_URL")\n            if os.getenv(name, "").strip()\n        ), "")
+        # Support the canonical name plus common deployment aliases.
+        remote_url = next((
+            os.getenv(name, "").strip()
+            for name in ("REMOTE_CONFIG_URL", "CHANNELS_URL", "CHANNELS_CONFIG_URL")
+            if os.getenv(name, "").strip()
+        ), "")
 
         channels: list[Channel] = []
 
