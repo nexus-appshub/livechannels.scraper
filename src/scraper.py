@@ -401,6 +401,81 @@ def load_channels(path: Path, output_root: Path) -> list[Channel]:
     return result
 
 
+async def fetch_remote_channels(
+    session: aiohttp.ClientSession,
+    config_url: str,
+    output_dir: Path,
+    timeout: float,
+) -> list[Channel]:
+    """Load a simple remote JSON or M3U channel catalog."""
+    parsed = urlparse(config_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("REMOTE_CONFIG_URL must be a valid HTTP(S) URL")
+
+    async with session.get(
+        config_url,
+        allow_redirects=True,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+        headers={"Accept": "application/json, text/plain, */*"},
+    ) as response:
+        response.raise_for_status()
+        body = await response.text(errors="replace")
+        content_type = (response.headers.get("Content-Type") or "").lower()
+
+    items: list[Channel] = []
+
+    if "json" in content_type or body.lstrip().startswith("{") or body.lstrip().startswith("["):
+        data = json.loads(body)
+        raw_items = data.get("channels", []) if isinstance(data, dict) else data
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            if not item.get("name") or not item.get("url"):
+                continue
+
+            safe = "".join(
+                ch if ch.isalnum() or ch in "-_." else "_"
+                for ch in str(item["name"])
+            ).strip("_") or "channel"
+
+            items.append(
+                Channel(
+                    name=str(item["name"]),
+                    url=str(item["url"]),
+                    output_dir=output_dir / safe,
+                    headers={str(k): str(v) for k, v in (item.get("headers") or {}).items()},
+                    enabled=bool(item.get("enabled", True)),
+                    poll_seconds=float(item["poll_seconds"]) if item.get("poll_seconds") else None,
+                    max_bandwidth=int(item["max_bandwidth"]) if item.get("max_bandwidth") else None,
+                )
+            )
+    else:
+        pending_name: Optional[str] = None
+        for line in body.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#EXTINF:"):
+                pending_name = line.split(",", 1)[1].strip() if "," in line else None
+            elif not line.startswith("#") and pending_name:
+                safe = "".join(
+                    ch if ch.isalnum() or ch in "-_." else "_"
+                    for ch in pending_name
+                ).strip("_") or "channel"
+                items.append(
+                    Channel(
+                        name=pending_name,
+                        url=urljoin(config_url, line),
+                        output_dir=output_dir / safe,
+                        headers={},
+                        enabled=True,
+                    )
+                )
+                pending_name = None
+
+    return items
+
+
 class ChannelManager:
     """Compatibility facade for the web service around the scraper's channel registry."""
 
