@@ -27,6 +27,67 @@ from scraper import AccessDeniedError, Channel, ChannelWorker, HLSClient, load_c
 
 LOG = logging.getLogger("livechannels.service")
 
+async def fetch_remote_channels(
+    session: aiohttp.ClientSession,
+    config_url: str,
+    output_dir: Path,
+    timeout: float,
+) -> list[Channel]:
+    """Load a JSON or simple M3U channel catalog from a configured remote URL."""
+    parsed = urlparse(config_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("REMOTE_CONFIG_URL must be a valid http(s) URL")
+
+    async with session.get(
+        config_url,
+        allow_redirects=True,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+        headers={"Accept": "application/json, text/plain, */*"},
+    ) as response:
+        response.raise_for_status()
+        body = await response.text(errors="replace")
+        content_type = (response.headers.get("Content-Type") or "").lower()
+
+    channels: list[Channel] = []
+
+    if "json" in content_type or body.lstrip().startswith("{"):
+        data = json.loads(body)
+        raw_items = data.get("channels", data if isinstance(data, list) else [])
+        for item in raw_items:
+            if not isinstance(item, dict) or not item.get("url") or not item.get("name"):
+                continue
+            headers = item.get("headers") or {}
+            channels.append(
+                Channel(
+                    name=str(item["name"]),
+                    url=str(item["url"]),
+                    output_dir=output_dir / str(item["name"]),
+                    headers={str(k): str(v) for k, v in headers.items()},
+                    enabled=bool(item.get("enabled", True)),
+                    poll_seconds=float(item["poll_seconds"]) if item.get("poll_seconds") else None,
+                    max_bandwidth=int(item["max_bandwidth"]) if item.get("max_bandwidth") else None,
+                )
+            )
+    else:
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        pending_name: str | None = None
+        for line in lines:
+            if line.startswith("#EXTINF:"):
+                pending_name = line.split(",", 1)[1].strip() if "," in line else None
+            elif not line.startswith("#") and pending_name:
+                channels.append(
+                    Channel(
+                        name=pending_name,
+                        url=urljoin(config_url, line),
+                        output_dir=output_dir / pending_name,
+                        headers={},
+                        enabled=True,
+                    )
+                )
+                pending_name = None
+
+    return channels
+
 
 def channel_id(channel: Channel) -> str:
     import re
@@ -235,14 +296,28 @@ async def run_service() -> None:
     try:
         channels = load_channels(config_path, output_dir)
     except FileNotFoundError:
-        LOG.warning(
-            "No channel configuration found. Set CHANNELS_JSON or provide %s.",
-            config_path,
-        )
         channels = []
     except json.JSONDecodeError as exc:
         LOG.error("Invalid channel configuration JSON: %s", exc)
         channels = []
+
+    # Load remote channel catalog when no local/environment config is present.
+    remote_config_url = os.getenv("REMOTE_CONFIG_URL", "").strip()
+    if not channels and remote_config_url:
+        try:
+            bootstrap_timeout = float(os.getenv("REMOTE_CONFIG_TIMEOUT", "15"))
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=bootstrap_timeout)
+            ) as bootstrap_session:
+                channels = await fetch_remote_channels(
+                    bootstrap_session,
+                    remote_config_url,
+                    output_dir,
+                    bootstrap_timeout,
+                )
+            LOG.info("loaded %d channel(s) from REMOTE_CONFIG_URL", len(channels))
+        except Exception:
+            LOG.exception("remote channel configuration could not be loaded")
 
     by_id = channel_lookup(channels)
     allowed_hosts_by_channel: dict[str, set[str]] = {}
