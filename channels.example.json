@@ -1,0 +1,15 @@
+{
+  "channels": [
+    {
+      "name": "Example Channel",
+      "url": "https://YOUR-AUTHORIZED-HOST.example/live/master.m3u8",
+      "enabled": true,
+      "headers": {
+        "Referer": "https://YOUR-AUTHORIZED-WEB-APP.example/",
+        "Origin": "https://YOUR-AUTHORIZED-WEB-APP.example"
+      },
+      "poll_seconds": 2,
+      "max_bandwidth": 8000000
+    }
+  ]
+}
